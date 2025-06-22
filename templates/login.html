@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Connexion sécurisée</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="login-container">
+        <h2>🔐 Accès sécurisé</h2>
+        {% if error %}
+            <p style="color: red;">{{ error }}</p>
+        {% endif %}
+        <form method="POST">
+            <label>Nom d'utilisateur :</label>
+            <input type="text" name="username" required><br>
+            <label>Mot de passe :</label>
+            <input type="password" name="password" required><br>
+            <button type="submit">Se connecter</button>
+        </form>
+        <a href="{{ url_for('index') }}">Retour à l’accueil</a>
+    </div>
+</body>
+</html>
