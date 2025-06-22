@@ -3,4 +3,5 @@ requests
 fpdf2          # bibliothèque PDF UTF-8
 cryptography   # vérif SSL
 gunicorn
+matplotlib
 
