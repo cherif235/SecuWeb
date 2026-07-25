@@ -114,5 +114,6 @@ python app.py
 Abakar Tahir Cherif
 
 Licence Informatique
+Master en Cybersécurité réseau et infrastructure (CODA)
 
 Passionné par les systèmes, les réseaux et la cybersécurité.
