@@ -108,6 +108,11 @@ source venv/bin/activate
 pip install -r requirements.txt
 
 python app.py
+
+
+pour télécharger le rapport :
+LOGIN_USERNAME=admin
+LOGIN_PASSWORD=secu123
 ```
 # Auteur
 
