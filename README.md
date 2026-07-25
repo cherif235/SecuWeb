@@ -111,8 +111,8 @@ python app.py
 
 
 pour télécharger le rapport :
-LOGIN_USERNAME=admin
-LOGIN_PASSWORD=secu123
+USERNAME=admin
+PASSWORD=secu123
 ```
 # Auteur
 
