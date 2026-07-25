@@ -84,13 +84,14 @@ Ce projet m'a permis d'approfondir plusieurs notions importantes en cybersécuri
 
 ```text
 SecuWeb/
-│
 ├── app.py
 ├── scanner.py
 ├── templates/
 ├── static/
+├── screenshots/
 ├── requirements.txt
-└── rapport-securite.pdf
+├── .gitignore
+└── README.md
 ```
 
 ---
