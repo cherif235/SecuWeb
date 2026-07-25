@@ -114,6 +114,26 @@ pour télécharger le rapport :
 USERNAME=admin
 PASSWORD=secu123
 ```
+## 📸 Aperçu
+
+### Interface principale
+
+![Interface principale de SecuWeb](screenshots/accueil.png)
+
+### Résultats d'une analyse
+
+![Résultats d'une analyse SecuWeb](screenshots/resultat1.png)
+![Résultats d'une analyse SecuWeb](screenshots/resultat2.png)
+![Résultats d'une analyse SecuWeb](screenshots/resultat3.png)
+![Résultats d'une analyse SecuWeb](screenshots/resultat4.png)
+
+### Rapport PDF généré
+
+![Rapport PDF SecuWeb](screenshots/rapport.png)
+
+
+
+
 # Auteur
 
 Abakar Tahir Cherif
