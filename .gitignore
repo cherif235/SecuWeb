@@ -27,3 +27,8 @@ rapport-securite-*.pdf
 Thumbs.db
 # Sauvegardes locales
 *_backup.py
+# Données locales de l'application
+instance/
+
+# Tests Python
+.pytest_cache/
