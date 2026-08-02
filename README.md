@@ -168,9 +168,25 @@ Ouvrir ensuite <http://127.0.0.1:5000>.
 
 ![Interface principale de SecuWeb](screenshots/accueil.png)
 
-### Résultats d'une analyse
+### Résultats de l’analyse
 
-![Résultats SecuWeb](screenshots/resultat1.png)
+#### Vue générale
+
+![Vue générale des résultats SecuWeb](screenshots/resultat1.png)
+
+#### Détails du score
+
+![Détails du score SecuWeb](screenshots/resultat2.png)
+
+#### Contrôles de sécurité
+
+![Contrôles de sécurité SecuWeb](screenshots/resultat3.png)
+
+#### Rapport et recommandations
+
+![Rapport et recommandations SecuWeb](screenshots/resultat5.png)
+
+## Auteur
 
 ## Auteur
 
