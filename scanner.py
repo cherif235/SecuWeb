@@ -1,5 +1,17 @@
-import ssl, socket, os, requests, tempfile, matplotlib.pyplot as plt
-from urllib.parse import urlparse
+import ipaddress
+import os
+from pathlib import Path
+import socket
+import ssl
+import tempfile
+from urllib.parse import urljoin, urlparse
+
+import matplotlib
+
+matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import requests
 from cryptography import x509
 from cryptography.hazmat.backends import default_backend
 from datetime import datetime, timezone
@@ -7,7 +19,10 @@ from fpdf import FPDF
 
 # ───────────────────────────── Configuration ──────────────────────────────────
 DEFAULT_TIMEOUT = 8
+MAX_REDIRECTS = 5
 USER_AGENT = "SecuWeb/2.0 - educational web security scanner"
+BASE_DIR = Path(__file__).resolve().parent
+LOGO_PATH = BASE_DIR / "static" / "logo.png"
 
 # Les tests SQLi/XSS ci-dessous sont volontairement légers.
 # Ils cherchent des INDICES et ne prétendent pas confirmer une vulnérabilité.
@@ -25,22 +40,85 @@ def _normalize_url(url: str) -> str:
         raise ValueError("URL vide")
     if not url.startswith(("http://", "https://")):
         url = "https://" + url
+
     parsed = urlparse(url)
+    if parsed.scheme.lower() not in {"http", "https"}:
+        raise ValueError("Seuls les protocoles HTTP et HTTPS sont autorisés")
     if not parsed.hostname:
         raise ValueError("URL invalide")
+    if parsed.username or parsed.password:
+        raise ValueError("Les identifiants intégrés dans une URL sont interdits")
+
+    try:
+        parsed.port
+    except ValueError as exc:
+        raise ValueError("Port invalide") from exc
+
+    return url
+
+
+def _validate_public_url(url: str) -> str:
+    """Bloque localhost, les réseaux privés et les adresses non routables."""
+    url = _normalize_url(url)
+    hostname = urlparse(url).hostname
+
+    try:
+        direct_ip = ipaddress.ip_address(hostname)
+        addresses = {direct_ip}
+    except ValueError:
+        try:
+            addresses = {
+                ipaddress.ip_address(item[4][0])
+                for item in socket.getaddrinfo(hostname, None)
+            }
+        except socket.gaierror as exc:
+            raise ValueError("Nom de domaine introuvable") from exc
+
+    if not addresses:
+        raise ValueError("Aucune adresse IP trouvée")
+
+    blocked = [address for address in addresses if not address.is_global]
+    if blocked:
+        raise ValueError(
+            "Adresse locale, privée ou non routable interdite par SecuWeb"
+        )
+
     return url
 
 
 def _request(url, **kwargs):
     kwargs.setdefault("timeout", DEFAULT_TIMEOUT)
-    kwargs.setdefault("allow_redirects", True)
-    return _session().get(url, **kwargs)
+    kwargs.pop("allow_redirects", None)
+    current_url = _normalize_url(url)
+
+    with _session() as client:
+        for redirect_count in range(MAX_REDIRECTS + 1):
+            current_url = _validate_public_url(current_url)
+            response = client.get(current_url, allow_redirects=False, **kwargs)
+
+            if not (response.is_redirect or response.is_permanent_redirect):
+                return response
+
+            location = response.headers.get("Location")
+            if not location:
+                return response
+
+            if redirect_count == MAX_REDIRECTS:
+                raise requests.TooManyRedirects(
+                    f"Plus de {MAX_REDIRECTS} redirections"
+                )
+
+            current_url = urljoin(current_url, location)
+            # Les paramètres concernent uniquement la requête initiale.
+            kwargs.pop("params", None)
+
+    raise requests.TooManyRedirects("Boucle de redirection")
 
 
 # ───────────────────────────── Analyse du site ────────────────────────────────
 def analyse_site(url: str) -> dict:
     try:
-        url = _normalize_url(url)
+        url = _validate_public_url(url)
     except ValueError as exc:
         return {
             "url": url,
@@ -64,7 +142,7 @@ def analyse_site(url: str) -> dict:
     request_error = None
     try:
         resp = _request(url)
-    except requests.RequestException as exc:
+    except (requests.RequestException, ValueError) as exc:
         request_error = f"{type(exc).__name__}: {exc}"
 
     report = {
@@ -86,11 +164,9 @@ def analyse_site(url: str) -> dict:
 
 # ───────────────────────────── Contrôles techniques ───────────────────────────
 def check_ssl(url):
-    host = urlparse(url).hostname
-    if not host:
-        return {"valid": False, "error": "Nom d'hôte invalide"}
-
     try:
+        url = _validate_public_url(url)
+        host = urlparse(url).hostname
         ctx = ssl.create_default_context()
         with socket.create_connection((host, 443), timeout=5) as raw_sock:
             with ctx.wrap_socket(raw_sock, server_hostname=host) as tls_sock:
@@ -138,7 +214,7 @@ def cookie_audit(cookies):
 
     Important : requests ne conserve pas toujours tous les attributs Set-Cookie
     de façon uniforme. Lorsqu'un attribut ne peut pas être établi avec
-    suffisamment de certitude, SecuWeb retourne "Non determine" plutôt que False.
+    suffisamment de certitude, SecuWeb retourne "Non déterminé" plutôt que False.
     """
     out = []
 
@@ -153,12 +229,12 @@ def cookie_audit(cookies):
         if "httponly" in rest_lower:
             httponly = True
         else:
-            httponly = "Non determine"
+            httponly = "Non déterminé"
 
         # SameSite n'est pas garanti dans CookieJar.
         samesite = rest_lower.get("samesite")
         if samesite in (None, ""):
-            samesite = "Non determine"
+            samesite = "Non déterminé"
 
         out.append({
             "name": cookie.name,
@@ -208,7 +284,7 @@ def sql_test(url):
         if new_markers:
             return "Indice détecté"
         return "Aucun indice détecté"
-    except requests.RequestException:
+    except (requests.RequestException, ValueError):
         return "Non testable"
 
 
@@ -222,9 +298,9 @@ def xss_test(url):
     try:
         response = _request(url, params={"secuweb_xss": marker})
         if marker in response.text:
-            return "Réflexion détectée"
+            return "Entrée réfléchie à vérifier"
         return "Aucun indice détecté"
-    except requests.RequestException:
+    except (requests.RequestException, ValueError):
         return "Non testable"
 
 
@@ -235,7 +311,7 @@ def https_redirect(url):
     try:
         response = _request(f"http://{host}")
         return response.url.lower().startswith("https://")
-    except requests.RequestException:
+    except (requests.RequestException, ValueError):
         return False
 
 
@@ -263,11 +339,13 @@ def compute_score(report):
     if isinstance(http_code, int):
         http_score = 10 if 200 <= http_code < 400 else 0
         final_url = report.get("final_url") or ""
-        if report.get("https_redirect") or final_url.lower().startswith("https://"):
-            http_score += 10
-        details["HTTP"] = min(http_score, 20)
+        if final_url.lower().startswith("https://"):
+            http_score += 5
+        if report.get("https_redirect"):
+            http_score += 5
+        details["HTTP/HTTPS"] = min(http_score, 20)
     else:
-        details["HTTP"] = None
+        details["HTTP/HTTPS"] = None
 
     sql_status = report.get("sql_injection")
     if sql_status == "Aucun indice détecté":
@@ -280,18 +358,23 @@ def compute_score(report):
     xss_status = report.get("xss")
     if xss_status == "Aucun indice détecté":
         details["XSS"] = 20
-    elif xss_status == "Réflexion détectée":
-        details["XSS"] = 5
+    elif xss_status in {
+        "Réflexion détectée",
+        "Entrée réfléchie à vérifier",
+    }:
+        # Une réflexion n'est pas une faille XSS confirmée. Elle reçoit un
+        # score intermédiaire en attendant une vérification manuelle.
+        details["XSS"] = 10
     else:
         details["XSS"] = None
 
     headers = report.get("headers", {})
     if headers:
-        details["Headers"] = min(
+        details["En-têtes"] = min(
             sum(4 for present in headers.values() if present), 20
         )
     else:
-        details["Headers"] = None
+        details["En-têtes"] = None
 
     available = [v for v in details.values() if isinstance(v, (int, float))]
     if not available:
@@ -302,23 +385,85 @@ def compute_score(report):
 
 
 # ────────────────────────────── Génération PDF ────────────────────────────────
+BRAND_NAVY = (15, 23, 42)
+BRAND_BLUE = (37, 99, 235)
+BRAND_CYAN = (14, 165, 233)
+BRAND_LIGHT = (239, 246, 255)
+TEXT_DARK = (30, 41, 59)
+TEXT_MUTED = (100, 116, 139)
+
+
+def _configure_pdf_fonts(pdf):
+    """Utilise une police Unicode embarquée lorsqu'elle est disponible."""
+    font_directories = (
+        BASE_DIR / "static" / "fonts",
+        Path("/usr/share/fonts/truetype/dejavu"),
+    )
+
+    for directory in font_directories:
+        regular = directory / "DejaVuSans.ttf"
+        bold = directory / "DejaVuSans-Bold.ttf"
+        if not (regular.is_file() and bold.is_file()):
+            continue
+
+        pdf.add_font("SecuWebSans", "", str(regular))
+        pdf.add_font("SecuWebSans", "B", str(bold))
+        # Le fichier normal sert de repli portable pour le texte secondaire.
+        pdf.add_font("SecuWebSans", "I", str(regular))
+        pdf.brand_font = "SecuWebSans"
+        return
+
+    pdf.brand_font = "Helvetica"
+
+
 class CustomPDF(FPDF):
     def header(self):
-        if os.path.exists("static/logo.png"):
-            self.image("static/logo.png", x=175, y=5, w=20)
+        # La première page possède sa propre couverture.
+        if self.page_no() == 1:
+            return
+
+        self.set_fill_color(*BRAND_NAVY)
+        self.rect(0, 0, self.w, 20, "F")
+
+        if LOGO_PATH.is_file():
+            self.image(str(LOGO_PATH), x=14, y=3.5, w=13, h=13)
+
+        self.set_xy(32, 5)
+        self.set_font(self.brand_font, "B", 11)
+        self.set_text_color(255, 255, 255)
+        self.cell(90, 8, "SECUWEB", align="L")
+
+        self.set_xy(120, 5)
+        self.set_font(self.brand_font, "", 8)
+        self.set_text_color(203, 213, 225)
+        self.cell(75, 8, "RAPPORT D'ANALYSE DE SÉCURITÉ", align="R")
+
+        self.set_draw_color(*BRAND_CYAN)
+        self.set_line_width(0.7)
+        self.line(14, 20, self.w - 14, 20)
+        self.set_y(27)
 
     def footer(self):
-        self.set_y(-15)
-        self.set_font("Helvetica", "I", 8)
-        self.set_text_color(110, 110, 110)
+        self.set_y(-16)
+        self.set_draw_color(203, 213, 225)
+        self.set_line_width(0.3)
+        self.line(15, self.get_y(), self.w - 15, self.get_y())
+
+        self.set_y(-13)
+        self.set_font(self.brand_font, "", 8)
+        self.set_text_color(*TEXT_MUTED)
+        self.cell(90, 7, "AbakarTech | SecuWeb 2.1", align="L")
         self.cell(
-            0, 10,
-            f"AbakarTech - SecuWeb 2.1 | Page {self.page_no()}/{{nb}}",
-            align="C",
+            90,
+            7,
+            f"Page {self.page_no()}/{{nb}}",
+            align="R",
         )
+
 
 def safe_text(value):
     return "Non disponible" if value is None else str(value)
+
 
 def write_line(pdf, text, h=7):
     pdf.set_x(pdf.l_margin)
@@ -331,22 +476,28 @@ def write_line(pdf, text, h=7):
     )
 
 def section_title(pdf, number, title):
+    if pdf.get_y() > 258:
+        pdf.add_page()
+
     pdf.ln(4)
-    pdf.set_font("Helvetica", "B", 13)
-    pdf.set_text_color(0, 102, 204)
-    write_line(pdf, f"{number}. {title}", 8)
-    pdf.set_draw_color(200, 200, 200)
-    pdf.set_line_width(0.3)
     y = pdf.get_y()
-    pdf.line(pdf.l_margin, y, pdf.w - pdf.r_margin, y)
-    pdf.ln(3)
+    pdf.set_fill_color(*BRAND_LIGHT)
+    pdf.rect(pdf.l_margin, y, pdf.epw, 11, "F")
+    pdf.set_fill_color(*BRAND_BLUE)
+    pdf.rect(pdf.l_margin, y, 3, 11, "F")
+    pdf.set_xy(pdf.l_margin + 7, y + 1.5)
+    pdf.set_font(pdf.brand_font, "B", 12)
+    pdf.set_text_color(*BRAND_NAVY)
+    pdf.cell(pdf.epw - 7, 8, f"{number}. {title}")
+    pdf.set_y(y + 14)
+
 
 def draw_score_bar(pdf, label, percent):
     if pdf.get_y() > 265:
         pdf.add_page()
 
     percent = max(0, min(100, percent))
-    x_label, x_bar, max_w, h = 20, 60, 110, 6
+    x_label, x_bar, max_w, h = 20, 64, 92, 6
     y = pdf.get_y() + 2
     bar_w = (percent / 100) * max_w
 
@@ -358,87 +509,137 @@ def draw_score_bar(pdf, label, percent):
         fill = (204, 0, 0)
 
     pdf.set_xy(x_label, y - 1)
-    pdf.set_font("Helvetica", "", 10)
-    pdf.set_text_color(40, 40, 40)
-    pdf.cell(35, 8, safe_text(label))
+    pdf.set_font(pdf.brand_font, "", 10)
+    pdf.set_text_color(*TEXT_DARK)
+    pdf.cell(40, 8, safe_text(label))
 
-    pdf.set_fill_color(230, 230, 230)
+    pdf.set_fill_color(226, 232, 240)
     pdf.rect(x_bar, y, max_w, h, "F")
     pdf.set_fill_color(*fill)
     pdf.rect(x_bar, y, bar_w, h, "F")
 
-    pdf.set_xy(x_bar + max_w + 3, y - 1)
+    pdf.set_xy(x_bar + max_w + 4, y - 1)
+    pdf.set_font(pdf.brand_font, "B", 9)
     pdf.cell(20, 8, f"{int(percent)}%")
     pdf.set_y(y + 10)
     pdf.set_x(pdf.l_margin)
 
-def generate_pdf(result):
+def generate_pdf(result, output_path="rapport-securite.pdf"):
     pdf = CustomPDF()
+    _configure_pdf_fonts(pdf)
     pdf.alias_nb_pages()
     pdf.set_auto_page_break(auto=True, margin=20)
-    pdf.set_margins(left=15, top=15, right=15)
+    pdf.set_margins(left=15, top=28, right=15)
 
-    # Page 1 : couverture
+    # Page 1 : couverture professionnelle
     pdf.add_page()
-    pdf.ln(18)
+    pdf.set_fill_color(*BRAND_NAVY)
+    pdf.rect(0, 0, pdf.w, 96, "F")
+    pdf.set_fill_color(*BRAND_BLUE)
+    pdf.rect(0, 92, pdf.w, 4, "F")
 
-    pdf.set_font("Helvetica", "B", 22)
-    pdf.set_text_color(33, 53, 85)
-    pdf.cell(0, 12, "ABAKARTECH", align="C", new_x="LMARGIN", new_y="NEXT")
+    if LOGO_PATH.is_file():
+        pdf.image(str(LOGO_PATH), x=168, y=14, w=24, h=24)
 
-    pdf.set_font("Helvetica", "B", 17)
-    pdf.set_text_color(0, 102, 204)
+    pdf.set_xy(18, 16)
+    pdf.set_font(pdf.brand_font, "B", 9)
+    pdf.set_text_color(*BRAND_CYAN)
+    pdf.cell(90, 7, "ABAKARTECH | CYBERSÉCURITÉ")
+
+    pdf.set_xy(18, 34)
+    pdf.set_font(pdf.brand_font, "B", 29)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(120, 13, "SECUWEB")
+
+    pdf.set_xy(18, 51)
+    pdf.set_font(pdf.brand_font, "B", 17)
+    pdf.set_text_color(226, 232, 240)
+    pdf.cell(175, 10, "Rapport d'analyse de sécurité Web")
+
+    pdf.set_xy(18, 68)
+    pdf.set_font(pdf.brand_font, "", 9)
+    pdf.set_text_color(148, 163, 184)
     pdf.cell(
-        0, 12, "Rapport d'analyse de securite Web",
-        align="C", new_x="LMARGIN", new_y="NEXT"
+        175,
+        7,
+        "SSL/TLS | HTTP | En-têtes | Cookies | Indices SQLi et XSS",
     )
-
-    pdf.set_draw_color(0, 102, 204)
-    pdf.set_line_width(0.8)
-    y = pdf.get_y() + 2
-    pdf.line(45, y, 165, y)
-    pdf.ln(15)
-
-    pdf.set_font("Helvetica", "", 12)
-    pdf.set_text_color(40, 40, 40)
 
     ts = result.get("timestamp") or datetime.now().strftime("%d/%m/%Y %H:%M")
-    write_line(pdf, f"Site analyse : {result.get('url', 'Non disponible')}")
-    write_line(pdf, f"Date de l'analyse : {ts}")
-    pdf.ln(8)
-
     score = result.get("score", 0)
-    pdf.set_font("Helvetica", "B", 18)
     if score >= 80:
-        pdf.set_text_color(0, 153, 76)
+        score_color = (0, 153, 76)
+        score_label = "Niveau observé : élevé"
     elif score >= 50:
-        pdf.set_text_color(255, 140, 0)
+        score_color = (234, 88, 12)
+        score_label = "Niveau observé : intermédiaire"
     else:
-        pdf.set_text_color(204, 0, 0)
+        score_color = (190, 24, 93)
+        score_label = "Niveau observé : à renforcer"
 
-    pdf.cell(
-        0, 12, f"Indice SecuWeb : {score}/100",
-        align="C", new_x="LMARGIN", new_y="NEXT"
+    # Carte d'identification de l'analyse
+    pdf.set_fill_color(*BRAND_LIGHT)
+    pdf.rect(15, 111, 180, 45, "F")
+    pdf.set_fill_color(*BRAND_BLUE)
+    pdf.rect(15, 111, 3, 45, "F")
+
+    pdf.set_xy(24, 117)
+    pdf.set_font(pdf.brand_font, "B", 9)
+    pdf.set_text_color(*TEXT_MUTED)
+    pdf.cell(35, 7, "SITE ANALYSÉ")
+    pdf.set_xy(24, 125)
+    pdf.set_font(pdf.brand_font, "B", 11)
+    pdf.set_text_color(*TEXT_DARK)
+    pdf.multi_cell(108, 6, safe_text(result.get("url")))
+
+    pdf.set_xy(24, 143)
+    pdf.set_font(pdf.brand_font, "", 9)
+    pdf.set_text_color(*TEXT_MUTED)
+    pdf.cell(105, 6, f"Analyse générée le {ts}")
+
+    # Bloc score
+    pdf.set_fill_color(*score_color)
+    pdf.rect(145, 116, 40, 31, "F")
+    pdf.set_xy(145, 120)
+    pdf.set_font(pdf.brand_font, "B", 22)
+    pdf.set_text_color(255, 255, 255)
+    pdf.cell(40, 11, f"{score}", align="C")
+    pdf.set_xy(145, 133)
+    pdf.set_font(pdf.brand_font, "B", 8)
+    pdf.cell(40, 7, "INDICE / 100", align="C")
+
+    pdf.set_xy(24, 169)
+    pdf.set_font(pdf.brand_font, "B", 12)
+    pdf.set_text_color(*score_color)
+    pdf.cell(160, 8, score_label)
+
+    pdf.set_xy(24, 184)
+    pdf.set_font(pdf.brand_font, "", 10)
+    pdf.set_text_color(*TEXT_MUTED)
+    pdf.multi_cell(
+        162,
+        6,
+        "Ce document synthétise des contrôles automatisés portant sur le "
+        "chiffrement, la réponse HTTP, les en-têtes de sécurité, les cookies "
+        "et certains indices liés aux injections SQL et XSS.",
     )
-    pdf.ln(5)
-    draw_score_bar(pdf, "Indice SecuWeb", score)
-    pdf.ln(10)
 
-    pdf.set_font("Helvetica", "", 11)
-    pdf.set_text_color(70, 70, 70)
-    write_line(
-        pdf,
-        "Ce rapport presente des controles automatises de plusieurs elements de "
-        "securite du site : certificat SSL/TLS, reponse HTTP, en-tetes de "
-        "securite, cookies et controles heuristiques lies aux injections SQL et XSS. ""Ces controles recherchent des indices et ne confirment pas a eux seuls une vulnerabilite."
+    pdf.set_xy(24, 226)
+    pdf.set_font(pdf.brand_font, "I", 9)
+    pdf.set_text_color(*TEXT_MUTED)
+    pdf.multi_cell(
+        162,
+        6,
+        "Analyse indicative : un résultat automatisé ne confirme ni l'absence "
+        "ni la présence certaine d'une vulnérabilité.",
     )
 
     # Page 2 : informations générales
     pdf.add_page()
-    section_title(pdf, 1, "Informations generales")
+    section_title(pdf, 1, "Informations générales")
 
-    pdf.set_font("Times", "", 12)
-    pdf.set_text_color(40, 40, 40)
+    pdf.set_font(pdf.brand_font, "", 11)
+    pdf.set_text_color(*TEXT_DARK)
     write_line(pdf, f"URL : {result.get('url', 'Non disponible')}")
     write_line(pdf, f"Code HTTP : {result.get('http_code', 'Non disponible')}")
 
@@ -457,26 +658,38 @@ def generate_pdf(result):
 
     write_line(
         pdf,
+        "URL finale en HTTPS : "
+        + (
+            "Oui"
+            if str(result.get("final_url") or "").lower().startswith("https://")
+            else "Non"
+        )
+    )
+    write_line(
+        pdf,
         "Redirection HTTP vers HTTPS : "
         + ("Oui" if result.get("https_redirect") else "Non")
     )
     write_line(
         pdf,
-        f"Test SQL Injection : {result.get('sql_injection', 'Non testable')}"
+        f"Test d'injection SQL : {result.get('sql_injection', 'Non testable')}"
     )
-    write_line(pdf, f"Test XSS : {result.get('xss', 'Non testable')}")
+    write_line(
+        pdf,
+        f"Test de réflexion XSS : {result.get('xss', 'Non testable')}"
+    )
 
     # Score
-    section_title(pdf, 2, "Score de securite")
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.set_text_color(40, 40, 40)
+    section_title(pdf, 2, "Score de sécurité")
+    pdf.set_font(pdf.brand_font, "B", 12)
+    pdf.set_text_color(*TEXT_DARK)
     write_line(pdf, f"Indice SecuWeb : {score}/100")
     pdf.ln(3)
     draw_score_bar(pdf, "Global", score)
 
     for label, value in result.get("score_details", {}).items():
         if value is None:
-            pdf.set_font("Helvetica", "", 10)
+            pdf.set_font(pdf.brand_font, "", 10)
             pdf.set_text_color(100, 100, 100)
             write_line(pdf, f"{label} : Non testable", 6)
         else:
@@ -496,10 +709,14 @@ def generate_pdf(result):
 
         if labels and values:
             fig, ax = plt.subplots(figsize=(6, 3))
-            bars = ax.barh(labels, values)
+            bars = ax.barh(labels, values, color="#2563EB")
             ax.set_xlim(0, 20)
             ax.set_xlabel("Score / 20")
-            ax.set_title("Detail des scores de securite")
+            ax.set_title("Détail des scores de sécurité")
+            ax.grid(axis="x", color="#E2E8F0", linewidth=0.8)
+            ax.set_axisbelow(True)
+            ax.spines["top"].set_visible(False)
+            ax.spines["right"].set_visible(False)
 
             for bar in bars:
                 width = bar.get_width()
@@ -526,34 +743,34 @@ def generate_pdf(result):
 
     except Exception as e:
         pdf.set_text_color(180, 0, 0)
-        write_line(pdf, f"Graphique non genere : {e}")
-        pdf.set_text_color(40, 40, 40)
+        write_line(pdf, f"Graphique non généré : {e}")
+        pdf.set_text_color(*TEXT_DARK)
 
     finally:
         if tmp_path and os.path.exists(tmp_path):
             os.unlink(tmp_path)
 
     # En-têtes
-    section_title(pdf, 3, "En-tetes HTTP de securite")
-    pdf.set_font("Times", "", 11)
-    pdf.set_text_color(40, 40, 40)
+    section_title(pdf, 3, "En-têtes HTTP de sécurité")
+    pdf.set_font(pdf.brand_font, "", 10)
+    pdf.set_text_color(*TEXT_DARK)
 
     headers = result.get("headers", {})
     if not headers:
-        write_line(pdf, "Aucune information disponible concernant les en-tetes.")
+        write_line(pdf, "Aucune information disponible concernant les en-têtes.")
     else:
         for header, present in headers.items():
-            status = "Present" if present else "Absent"
+            status = "Présent" if present else "Absent"
             write_line(pdf, f"- {header} : {status}")
 
     # Cookies
     section_title(pdf, 4, "Cookies")
-    pdf.set_font("Times", "", 11)
-    pdf.set_text_color(40, 40, 40)
+    pdf.set_font(pdf.brand_font, "", 10)
+    pdf.set_text_color(*TEXT_DARK)
 
     cookies = result.get("cookies", [])
     if not cookies:
-        write_line(pdf, "Aucun cookie detecte.")
+        write_line(pdf, "Aucun cookie détecté.")
     else:
         for index, cookie in enumerate(cookies, 1):
             write_line(
@@ -566,8 +783,8 @@ def generate_pdf(result):
                 h=6,
                 text=(
                     f"Secure : {cookie.get('Secure', False)} | "
-                    f"HttpOnly : {cookie.get('HttpOnly', 'Non determine')} | "
-                    f"SameSite : {cookie.get('SameSite', 'Non determine')}"
+                    f"HttpOnly : {cookie.get('HttpOnly', 'Non déterminé')} | "
+                    f"SameSite : {cookie.get('SameSite', 'Non déterminé')}"
                 ),
                 new_x="LMARGIN",
                 new_y="NEXT",
@@ -577,44 +794,45 @@ def generate_pdf(result):
     # Conclusion
     pdf.add_page()
     section_title(pdf, 5, "Conclusion")
-    pdf.set_font("Times", "", 12)
-    pdf.set_text_color(40, 40, 40)
+    pdf.set_font(pdf.brand_font, "", 11)
+    pdf.set_text_color(*TEXT_DARK)
 
     if score >= 80:
         conclusion = (
-            "Les controles SecuWeb obtiennent un indice eleve. Les elements "
-            "observes sont majoritairement conformes aux controles effectues. Les protections "
-            "correctement configurees. Une verification periodique reste recommandee."
+            "Les contrôles SecuWeb obtiennent un indice élevé. Les éléments "
+            "observés sont majoritairement conformes aux contrôles effectués. "
+            "Les protections analysées semblent correctement configurées. "
+            "Une vérification périodique reste recommandée."
         )
     elif score >= 60:
         conclusion = (
-            "Les controles SecuWeb obtiennent un indice globalement satisfaisant, "
-            "mais certaines protections peuvent encore etre renforcees. Les elements "
-            "signales comme absents ou insuffisants doivent etre examines en priorite."
+            "Les contrôles SecuWeb obtiennent un indice globalement satisfaisant, "
+            "mais certaines protections peuvent encore être renforcées. Les éléments "
+            "signalés comme absents ou insuffisants doivent être examinés en priorité."
         )
     elif score >= 40:
         conclusion = (
-            "L indice SecuWeb est moyen. Plusieurs protections "
+            "L'indice SecuWeb est moyen. Plusieurs protections "
             "importantes sont absentes ou insuffisantes. Des mesures correctives "
-            "sont recommandees afin de reduire l'exposition du site aux attaques."
+            "sont recommandées afin de réduire l'exposition du site aux attaques."
         )
     else:
         conclusion = (
-            "L indice SecuWeb est faible selon les controles automatises "
-            "effectues. Plusieurs mesures de protection doivent etre examinees et "
-            "renforcees en priorite."
+            "L'indice SecuWeb est faible selon les contrôles automatisés "
+            "effectués. Plusieurs mesures de protection doivent être examinées et "
+            "renforcées en priorité."
         )
 
     write_line(pdf, conclusion)
 
     # Recommandations
     pdf.ln(5)
-    pdf.set_font("Helvetica", "B", 12)
-    pdf.set_text_color(0, 102, 204)
+    pdf.set_font(pdf.brand_font, "B", 12)
+    pdf.set_text_color(*BRAND_BLUE)
     write_line(pdf, "Recommandations")
 
-    pdf.set_font("Times", "", 11)
-    pdf.set_text_color(40, 40, 40)
+    pdf.set_font(pdf.brand_font, "", 10)
+    pdf.set_text_color(*TEXT_DARK)
     recommendations = []
 
     if not ssl_info.get("valid"):
@@ -628,14 +846,14 @@ def generate_pdf(result):
     for header, present in headers.items():
         if not present:
             recommendations.append(
-                f"Configurer l'en-tete de securite {header}."
+                f"Configurer l'en-tête de sécurité {header}."
             )
 
     for cookie in cookies:
         name = cookie.get("name", "Sans nom")
         if not cookie.get("Secure"):
             recommendations.append(
-                f"Verifier et, si approprie, activer l'attribut Secure pour le cookie {name}."
+                f"Vérifier et, si approprié, activer l'attribut Secure pour le cookie {name}."
             )
         if cookie.get("HttpOnly") is False:
             recommendations.append(
@@ -644,14 +862,20 @@ def generate_pdf(result):
 
     if result.get("sql_injection") == "Indice détecté":
         recommendations.append(
-            "Un indice d erreur SQL a ete observe. Verifier manuellement les entrees utilisateur et utiliser des requetes parametrees "
-            "afin de reduire les risques d'injection SQL."
+            "Un indice d'erreur SQL a été observé. Vérifier manuellement les entrées "
+            "utilisateur et utiliser des requêtes paramétrées afin de réduire les "
+            "risques d'injection SQL."
         )
 
-    if result.get("xss") == "Réflexion détectée":
+    if result.get("xss") in {
+        "Réflexion détectée",
+        "Entrée réfléchie à vérifier",
+    }:
         recommendations.append(
-            "Une reflexion de donnee a ete observee. Verifier le contexte de sortie, puis valider et encoder les entrees utilisateur afin de reduire les risques "
-            "de Cross-Site Scripting (XSS)."
+            "Une entrée réfléchie a été observée, sans confirmer une faille. "
+            "Vérifier manuellement le contexte de sortie, puis valider et encoder "
+            "les entrées utilisateur afin de réduire les risques de Cross-Site "
+            "Scripting (XSS)."
         )
 
     if recommendations:
@@ -660,38 +884,34 @@ def generate_pdf(result):
     else:
         write_line(
             pdf,
-            "Aucune recommandation critique n'a ete generee par les controles automatises."
+            "Aucune recommandation critique n'a été générée par les contrôles automatisés."
         )
 
-    # Methodologie / limites
     pdf.ln(8)
-    pdf.set_font("Helvetica", "B", 11)
-    pdf.set_text_color(0, 102, 204)
-    write_line(pdf, "Limites de l'analyse", 6)
-    pdf.set_font("Times", "", 10)
-    pdf.set_text_color(70, 70, 70)
+    pdf.set_font(pdf.brand_font, "B", 11)
+    pdf.set_text_color(*BRAND_BLUE)
+    write_line(pdf, "Analyse", 6)
+    pdf.set_font(pdf.brand_font, "", 9)
+    pdf.set_text_color(*TEXT_MUTED)
     write_line(
         pdf,
-        "L'indice SecuWeb synthetise uniquement les controles executes par cet outil. "
-        "L'absence d'indice SQLi ou XSS ne prouve pas l'absence de vulnerabilite. "
-        "Une reflexion XSS est un signal a examiner manuellement et non une faille confirmee. "
-        "Certains attributs de cookies peuvent etre indetermines lorsque la bibliotheque HTTP "
-        "ne les expose pas de maniere fiable.",
+        "L'indice SecuWeb synthétise uniquement les contrôles exécutés par cet outil. ",
         6,
     )
 
     # Avertissement
     pdf.ln(8)
-    pdf.set_font("Times", "I", 10)
-    pdf.set_text_color(100, 100, 100)
+    pdf.set_font(pdf.brand_font, "I", 9)
+    pdf.set_text_color(*TEXT_MUTED)
     write_line(
         pdf,
-        "Ce rapport est genere automatiquement par SecuWeb. Les controles effectues "
-        "constituent une analyse indicative et ne remplacent pas un audit de securite "
-        "complet realise manuellement par un professionnel.",
+        "Ce rapport est généré automatiquement par SecuWeb. Les contrôles effectués "
+        "constituent une analyse indicative et ne remplacent pas un audit de sécurité "
+        "complet réalisé manuellement.",
         6,
     )
 
-    output_path = "rapport-securite.pdf"
-    pdf.output(output_path)
-    return output_path
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pdf.output(str(output_path))
+    return str(output_path)
